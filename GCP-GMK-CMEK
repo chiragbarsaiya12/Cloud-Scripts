@@ -1,0 +1,138 @@
+### IMPORTNAMT NOTES ### READ ME PLEASE ####
+ 
+#Script won't work if
+# 1) VM is Powered ON
+# 2) Provided Instance/Key Ring is not in below mentioned Project ID
+# 3) Provided Zone is not correct.
+ 
+#!/bin/bash
+#ScriptVer: 2
+#Created by: Chirag Barsaiya
+#Last Updated On: 22/03/2021
+#Updated Snapshot schedule attachment to new CMEK disks and detach from old GMK disks.
+((
+ 
+ 
+echo $'\e[1;34m' "Script to replace VM disks from GMK to CMK !"
+ 
+ 
+echo $'\e[1;32m' "Enter the Instance Name : "
+read instance
+echo $'\e[1;32m' "Enter the Zone Name e.g us-central1-a, us-east4-c etc : "
+read zone1
+echo $'\e[1;32m' "Enter the Key Ring Name : "
+read keyring
+key_name=$instance-key
+key_project_id=$key_project_id
+project_id=$non_project_id
+region="$(gcloud compute instances describe $instance --zone $zone1 |egrep "(subnetwork:)"|awk -F"regions/" '{print $2}'|awk -F"/" '{print $1}')"
+date=$(date -d "+90 days" '+%Y-%m-%d')
+ 
+echo $'\e[1;34m' "Will perform change on $instance"
+gcloud compute instances describe $instance --zone $zone1 | grep -e source -e diskSizeGb -e deviceName -e type -e status
+ 
+ 
+#Step 1 - Add key for server
+echo $'\e[1;32m' "Adding Key for $instance...."
+ 
+gcloud kms keys create $key_name --keyring=$keyring --purpose=encryption --location=$region --rotation-period=90d --next-rotation-time=$date --protection-level=software --project=$key_project_id
+ 
+#Step 2 - Copy Resource ID
+echo $'\e[1;32m' "Copy Resource ID...."
+ 
+gcloud kms keys describe $key_name --keyring=$keyring --location=$region --project=$key_project_id|grep "^name:"
+cmek_key="$(gcloud kms keys describe $key_name --keyring=$keyring --location=$region --project=$key_project_id|grep "^name:"|awk '{print $2}')"
+ 
+ 
+#Step 3 - Add compute agent IAM
+echo $'\e[1;32m' "Binding Permissions for ServiceAccount...."
+ 
+ 
+#find out project number
+project_number="$(gcloud projects describe $project_id|egrep "projectNumber:"|awk '{print $2}'|cut -d "'" -f 2)"
+ 
+ 
+gcloud kms keys add-iam-policy-binding $key_name --keyring=$keyring --project=$key_project_id --location=$region --member=serviceAccount:service-${project_number}@compute-system.iam.gserviceaccount.com --role=roles/cloudkms.cryptoKeyEncrypterDecrypter
+ 
+ 
+#Step 4 - Validate IAM
+echo $'\e[1;32m' "Validating IAM Access...."
+ 
+gcloud kms keys get-iam-policy $key_name --keyring=$keyring --location=$region --project=$key_project_id
+ 
+ 
+echo $'\e[1;32m' "checking the status of $instance...."
+status=$(gcloud compute instances describe $instance --zone $zone1 | grep status | awk '{print $2}')
+ 
+if [ $status == "TERMINATED" ]
+ 
+then
+ 
+{
+ 
+    #Finding Disks for Snapshot
+    gcloud compute instances describe $instance --zone $zone1 | grep source | awk '{ print $2 }' | awk ' BEGIN { FS="/" } { print $11 }' >disks.txt
+    gcloud compute instances describe $instance --zone $zone1 | grep boot | awk '{print $2}' >boot.txt
+    while IFS= read -r -u 4 line1 && IFS= read -r -u 5 line2; do
+    echo "$line1:$line2"
+    done 4<disks.txt 5<boot.txt > diskdetails.txt
+     
+    echo $'\e[1;33m' "Please verify the details before proceeding further"
+    gcloud compute instances describe $instance --zone $zone1  --format="yaml(name,status,disks)"
+    read -p "are you sure, above details are correct and continue further? [y/N]" -n 1 -r
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+    {
+    IFS=$'\n'; for diskdetails in $(awk '{print $0}' diskdetails.txt);
+    do
+        disk=$(echo $diskdetails | awk ' BEGIN { FS=":" } { print $1 }')
+        bootstatus=$(echo $diskdetails | awk ' BEGIN { FS=":" } { print $2 }')
+         
+        #Step 5 - Creating Snapshot
+        echo $'\e[1;32m' "Creating Snapshot for $disk Disks....Please wait"
+        gcloud compute disks snapshot $disk --project=$project_id --snapshot-names=$disk-cmek --zone=$zone1 --storage-location=$region
+ 
+ 
+        echo $'\e[1;32m' "Creating Disks for $disk Disks with Customer Managed Key...."
+        disktype=$(gcloud compute disks describe $disk --zone $zone1 | grep type | awk '{ print $2 }' | awk ' BEGIN { FS="/" } { print $11 }' | tail -1)
+        disksize=$(gcloud compute disks describe $disk --zone=$zone1 | grep -i sizeGb | awk '{print $2}' | cut -d "'" -f 2)
+        gcloud beta compute disks create $disk-cmek --project=$project_id --type=$disktype --zone=$zone1 --source-snapshot=$disk-cmek --kms-key=$cmek_key --size=$disksize
+ 
+ 
+        echo $'\e[0;33m' "Detaching GMK Disks for $disk....Please wait!"
+        gcloud compute instances detach-disk $instance --disk=$disk --zone=$zone1
+ 
+        if [ $bootstatus == "true" ]
+        then
+        {
+        echo $'\e[0;32m' "Attaching CMEK Boot Disks for $disk...."
+        gcloud compute instances attach-disk $instance --disk=$disk-cmek --zone=$zone1 --device-name=$disk --boot
+        resourcepolicies=$(gcloud compute disks describe $disk --zone $zone1 | grep resourcePolicies  | awk ' BEGIN { FS="/" } { print $11 }' | tail -1)
+        gcloud compute disks add-resource-policies $disk-cmek --resource-policies $resourcepolicies --zone $zone1
+        gcloud compute disks remove-resource-policies $disk --zone $zone1 --resource-policies $resourcepolicies
+        }
+        else
+        {
+        echo $'\e[0;34m' "Attaching CMEK Additional Disks for $disk...."
+        gcloud compute instances attach-disk $instance --disk=$disk-cmek --zone=$zone1 --device-name=$disk
+        }
+        fi
+    done
+    }
+    else
+    {
+    echo "exiting, please verify the details, and perform the task manually"
+    }
+    fi
+}
+ 
+echo $'\e[1;33m' "Please verify the details now, if the changes are as expected. once satisfied, please power on the VM from console."
+    gcloud compute instances describe $instance --zone $zone1  --format="yaml(name,status,disks)"
+ 
+else
+{
+echo "$instance is not yet Powered-off, please check"
+}
+fi
+echo $instance
+) 2>&1) | tee -a cmek_logs_`date +%d-%m-%Y-%I-%M`.txt
+  
